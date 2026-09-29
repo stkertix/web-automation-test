@@ -1,0 +1,117 @@
+:root {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --border: #d8dde6;
+  --text: #1c2330;
+  --muted: #5b6575;
+  --accent: #0f6e56;
+  --accent-hover: #0c5a46;
+  --danger: #b42318;
+  --warn: #b54708;
+  --ok: #027a48;
+  --failed-bg: #fef3f2;
+  --active-bg: #ecfdf3;
+  --btn-h: 2rem;
+  --btn-h-sm: 1.75rem;
+  --btn-fs: 0.8rem;
+  --btn-fs-sm: 0.72rem;
+  font-family: 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  line-height: 1.4;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 480px;
+  width: 100%;
+  background: var(--bg);
+}
+
+#app {
+  min-height: 100vh;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 6px;
+  min-height: var(--btn-h);
+  padding: 0 0.65rem;
+  font-size: var(--btn-fs);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+}
+
+button .fi {
+  font-size: 0.9em;
+  line-height: 1;
+}
+
+button.btn-sm {
+  min-height: var(--btn-h-sm);
+  padding: 0 0.5rem;
+  font-size: var(--btn-fs-sm);
+}
+
+button.btn-icon {
+  min-height: var(--btn-h-sm);
+  min-width: var(--btn-h-sm);
+  padding: 0;
+  font-size: 0.85rem;
+}
+
+button:hover:not(:disabled) {
+  border-color: #aeb6c4;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+button.danger {
+  color: var(--danger);
+  border-color: #fecdca;
+}
+
+.attribution {
+  margin: 0;
+  padding: 0.35rem 0.85rem 0.75rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.attribution a {
+  color: var(--muted);
+}
