@@ -3,6 +3,7 @@ import type {
   LibraryTest,
   StepType,
   TestCase,
+  TestEnvironment,
   TestFolder,
   TestLibrary,
   TestStep,
@@ -13,8 +14,10 @@ export const MessageType = {
   START_RECORDING: 'START_RECORDING',
   STOP_RECORDING: 'STOP_RECORDING',
   START_PLAYBACK: 'START_PLAYBACK',
+  PLAY_STEP: 'PLAY_STEP',
   STOP_PLAYBACK: 'STOP_PLAYBACK',
   GET_STATE: 'GET_STATE',
+  GET_CONTENT_MODE: 'GET_CONTENT_MODE',
   SAVE_TEST: 'SAVE_TEST',
   LOAD_TEST: 'LOAD_TEST',
   CLEAR_STEPS: 'CLEAR_STEPS',
@@ -37,6 +40,8 @@ export const MessageType = {
   RENAME_TEST: 'RENAME_TEST',
   IMPORT_LIBRARY: 'IMPORT_LIBRARY',
   IMPORT_FOLDER: 'IMPORT_FOLDER',
+  SET_ACTIVE_ENVIRONMENT: 'SET_ACTIVE_ENVIRONMENT',
+  SAVE_ENVIRONMENTS: 'SAVE_ENVIRONMENTS',
 
   // Element picker
   START_ELEMENT_PICK: 'START_ELEMENT_PICK',
@@ -63,17 +68,24 @@ export type ExtensionMessage =
   | { type: typeof MessageType.START_RECORDING }
   | { type: typeof MessageType.STOP_RECORDING }
   | { type: typeof MessageType.START_PLAYBACK }
+  | { type: typeof MessageType.PLAY_STEP; stepId: string }
   | { type: typeof MessageType.STOP_PLAYBACK }
   | { type: typeof MessageType.GET_STATE }
+  | { type: typeof MessageType.GET_CONTENT_MODE }
   | { type: typeof MessageType.SAVE_TEST; testCase: TestCase }
   | { type: typeof MessageType.LOAD_TEST; testCase: TestCase; folderId?: string | null }
   | { type: typeof MessageType.CLEAR_STEPS }
   | {
       type: typeof MessageType.ADD_STEP;
       stepType: StepType;
+      name?: string | null;
       selectors?: string[];
       value?: string | null;
       url?: string | null;
+      /** Pause after this step, in milliseconds. */
+      delayMs?: number;
+      /** Script steps: name that stores the script's return value. */
+      variableName?: string | null;
       /** Insert at this index; omit or null to append. */
       index?: number | null;
     }
@@ -85,7 +97,12 @@ export type ExtensionMessage =
   | {
       type: typeof MessageType.UPDATE_STEP;
       stepId: string;
-      patch: Partial<Pick<TestStep, 'type' | 'selectors' | 'value' | 'url'>>;
+      patch: Partial<
+        Pick<
+          TestStep,
+          'name' | 'type' | 'selectors' | 'value' | 'url' | 'delayMs' | 'variableName'
+        >
+      >;
     }
   | { type: typeof MessageType.DELETE_STEP; stepId: string }
   | { type: typeof MessageType.UPDATE_TEST_NAME; name: string }
@@ -116,6 +133,15 @@ export type ExtensionMessage =
     }
   | { type: typeof MessageType.RENAME_TEST; testId: string; name: string }
   | { type: typeof MessageType.IMPORT_LIBRARY; library: TestLibrary }
+  | {
+      type: typeof MessageType.SET_ACTIVE_ENVIRONMENT;
+      environmentId: string | null;
+    }
+  | {
+      type: typeof MessageType.SAVE_ENVIRONMENTS;
+      environments: TestEnvironment[];
+      activeEnvironmentId: string | null;
+    }
   | {
       type: typeof MessageType.IMPORT_FOLDER;
       /** Parent folder to nest under; null = top-level. */

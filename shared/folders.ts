@@ -1,5 +1,17 @@
-import type { LibraryTest, TestCase, TestFolder, TestLibrary } from './types';
-import { createFolder, createLibraryTest, toTestCase } from './types';
+import type {
+  LibraryTest,
+  TestCase,
+  TestEnvironment,
+  TestFolder,
+  TestLibrary,
+} from './types';
+import {
+  createFolder,
+  createId,
+  createLibraryTest,
+  normalizeDelayMs,
+  toTestCase,
+} from './types';
 
 export function normalizeFolders(folders: TestFolder[]): TestFolder[] {
   return folders.map((folder) => ({
@@ -90,12 +102,23 @@ export interface FolderExportPayload {
   folder: FolderExportNode;
 }
 
+export interface EnvironmentExportPayload {
+  version: 1;
+  type: 'environment-export';
+  exportedAt: string;
+  environments: TestEnvironment[];
+  activeEnvironmentId: string | null;
+}
+
 export interface LibraryExportPayload {
   version: 1;
   type: 'library-export';
   exportedAt: string;
   /** Snapshot of the full library (folders + tests + active selection). */
-  library: Pick<TestLibrary, 'version' | 'folders' | 'tests' | 'activeTestId'>;
+  library: Pick<TestLibrary, 'version' | 'folders' | 'tests' | 'activeTestId'> & {
+    environments?: TestEnvironment[];
+    activeEnvironmentId?: string | null;
+  };
 }
 
 export function buildFolderExport(
@@ -139,10 +162,32 @@ export function buildLibraryExport(library: TestLibrary): LibraryExportPayload {
         steps: test.steps.map((step) => ({
           ...step,
           selectors: [...step.selectors],
+          delayMs: normalizeDelayMs(step.delayMs),
         })),
       })),
       activeTestId: library.activeTestId,
+      environments: library.environments.map((env) => ({
+        ...env,
+        variables: env.variables.map((variable) => ({ ...variable })),
+      })),
+      activeEnvironmentId: library.activeEnvironmentId,
     },
+  };
+}
+
+export function buildEnvironmentExport(
+  environments: TestEnvironment[],
+  activeEnvironmentId: string | null,
+): EnvironmentExportPayload {
+  return {
+    version: 1,
+    type: 'environment-export',
+    exportedAt: new Date().toISOString(),
+    environments: environments.map((env) => ({
+      ...env,
+      variables: env.variables.map((variable) => ({ ...variable })),
+    })),
+    activeEnvironmentId,
   };
 }
 
@@ -172,8 +217,9 @@ export function materializeFolderImport(
             updatedAt: now,
             steps: testCase.steps.map((step) => ({
               ...step,
-              id: crypto.randomUUID(),
+              id: createId(),
               selectors: [...step.selectors],
+              delayMs: normalizeDelayMs(step.delayMs),
             })),
           },
           folder.id,
@@ -207,8 +253,9 @@ export function duplicateLibraryTest(source: LibraryTest): LibraryTest {
       updatedAt: now,
       steps: source.steps.map((step) => ({
         ...step,
-        id: crypto.randomUUID(),
+        id: createId(),
         selectors: [...step.selectors],
+        delayMs: normalizeDelayMs(step.delayMs),
       })),
     },
     source.folderId,

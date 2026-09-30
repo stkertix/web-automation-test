@@ -5,15 +5,29 @@ import {
   type ExtensionMessage,
   type MessageResponse,
 } from '../../../shared/messages';
-import type { StepType, TestStep } from '../../../shared/types';
+import {
+  DEFAULT_STEP_DELAY_MS,
+  DEFAULT_WAIT_MS,
+  MAX_SCRIPT_CHARS,
+  MAX_STEP_DELAY_MS,
+  MAX_STEP_NAME_CHARS,
+  MAX_WAIT_MS,
+  normalizeDelayMs,
+  normalizeWaitMs,
+  type StepType,
+  type TestStep,
+} from '../../../shared/types';
 
 export type StepDialogMode = 'add' | 'edit';
 
 export interface StepDialogResult {
   stepType: StepType;
+  name: string | null;
   selectors: string[];
   value: string | null;
   url: string | null;
+  delayMs: number;
+  variableName: string | null;
   index: number | null;
   stepId?: string;
 }
@@ -39,35 +53,64 @@ const STEP_TYPES: StepType[] = [
   'input',
   'change',
   'submit',
+  'wait',
+  'script',
+  'divider',
 ];
 
+const STEP_TYPE_LABELS: Record<StepType, string> = {
+  navigate: 'navigate',
+  click: 'click',
+  dblclick: 'dblclick',
+  input: 'input',
+  change: 'change',
+  submit: 'submit',
+  wait: 'wait element',
+  script: 'script',
+  divider: 'divider',
+};
+
 const stepType = ref<StepType>('click');
+const stepName = ref('');
 const target = ref('');
 const value = ref('');
+const timeoutMs = ref(String(DEFAULT_WAIT_MS));
+const delayMs = ref(String(DEFAULT_STEP_DELAY_MS));
+const variableName = ref('');
 const index = ref('');
 const error = ref('');
 const picking = ref(false);
 const pickedSelectors = ref<string[]>([]);
-const firstField = ref<HTMLInputElement | HTMLSelectElement | null>(null);
+const firstField = ref<HTMLInputElement | null>(null);
 let syncingTarget = false;
 
 const title = computed(() =>
   props.mode === 'edit' ? 'Edit step' : 'Add step',
 );
-const needsTarget = computed(() => true);
+const needsScript = computed(() => stepType.value === 'script');
+const isDivider = computed(() => stepType.value === 'divider');
+const needsTarget = computed(
+  () => stepType.value !== 'script' && stepType.value !== 'divider',
+);
 const targetLabel = computed(() =>
   stepType.value === 'navigate' ? 'URL' : 'Selector',
 );
 const targetPlaceholder = computed(() =>
   stepType.value === 'navigate'
-    ? 'https://example.com'
+    ? '{{baseUrl}}/login'
     : '#submit-btn or [data-testid="x"]',
 );
 const needsValue = computed(
   () => stepType.value === 'input' || stepType.value === 'change',
 );
+const needsTimeout = computed(() => stepType.value === 'wait');
 const showPosition = computed(() => props.mode === 'add');
-const canPickElement = computed(() => stepType.value !== 'navigate');
+const canPickElement = computed(
+  () =>
+    stepType.value !== 'navigate' &&
+    stepType.value !== 'script' &&
+    stepType.value !== 'divider',
+);
 
 const insertOptions = computed(() => {
   const options = [{ value: '', label: 'Append at end' }];
@@ -86,6 +129,7 @@ function syncFromProps(): void {
   syncingTarget = true;
   if (props.mode === 'edit' && props.step) {
     stepType.value = props.step.type;
+    stepName.value = props.step.name ?? '';
     pickedSelectors.value =
       props.step.type === 'navigate' ? [] : [...props.step.selectors];
     target.value =
@@ -93,15 +137,26 @@ function syncFromProps(): void {
         ? (props.step.url ?? '')
         : (props.step.selectors[0] ?? '');
     value.value = props.step.value ?? '';
+    timeoutMs.value = String(
+      props.step.type === 'wait'
+        ? normalizeWaitMs(props.step.value)
+        : DEFAULT_WAIT_MS,
+    );
+    delayMs.value = String(normalizeDelayMs(props.step.delayMs));
+    variableName.value = props.step.variableName ?? '';
     index.value = '';
     syncingTarget = false;
     return;
   }
 
   stepType.value = 'click';
+  stepName.value = '';
   pickedSelectors.value = [];
   target.value = '';
   value.value = '';
+  timeoutMs.value = String(DEFAULT_WAIT_MS);
+  delayMs.value = String(DEFAULT_STEP_DELAY_MS);
+  variableName.value = '';
   syncingTarget = false;
   if (props.initialIndex == null) {
     index.value = '';
@@ -179,10 +234,13 @@ watch(
 );
 
 watch(stepType, async (type) => {
-  if (type === 'navigate' && picking.value) {
+  if (
+    (type === 'navigate' || type === 'script' || type === 'divider') &&
+    picking.value
+  ) {
     await cancelPick();
   }
-  if (type === 'navigate') {
+  if (type === 'navigate' || type === 'script' || type === 'divider') {
     pickedSelectors.value = [];
   }
 });
@@ -226,13 +284,78 @@ function onKeydown(event: KeyboardEvent): void {
   }
 }
 
+function isNavigateTarget(value: string): boolean {
+  if (/\{\{\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}/.test(value)) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 function onSubmit(): void {
+  const script = value.value.trim();
+  if (needsScript.value) {
+    if (!script) {
+      error.value = 'Script is required.';
+      return;
+    }
+    if (script.length > MAX_SCRIPT_CHARS) {
+      error.value = `Script must be at most ${MAX_SCRIPT_CHARS} characters.`;
+      return;
+    }
+  }
+
   const trimmedTarget = target.value.trim();
-  if (!trimmedTarget) {
+  if (needsTarget.value && !trimmedTarget) {
     error.value =
       stepType.value === 'navigate'
         ? 'URL is required.'
         : 'Selector is required.';
+    return;
+  }
+  if (stepType.value === 'navigate' && !isNavigateTarget(trimmedTarget)) {
+    error.value =
+      'Enter an http(s) URL, or a value that includes {{variable}}.';
+    return;
+  }
+
+  let parsedTimeout = DEFAULT_WAIT_MS;
+  if (stepType.value === 'wait') {
+    parsedTimeout = Number.parseInt(timeoutMs.value, 10);
+    if (
+      !Number.isFinite(parsedTimeout) ||
+      parsedTimeout < 0 ||
+      parsedTimeout > MAX_WAIT_MS
+    ) {
+      error.value = `Timeout must be a whole number from 0 to ${MAX_WAIT_MS}.`;
+      return;
+    }
+  }
+
+  const trimmedVariable = variableName.value.trim();
+  if (
+    needsScript.value &&
+    trimmedVariable &&
+    (trimmedVariable.length > 64 ||
+      !/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmedVariable))
+  ) {
+    error.value =
+      'Variable name must start with a letter or underscore and use only letters, numbers, and underscores.';
+    return;
+  }
+
+  const parsedDelay = isDivider.value
+    ? 0
+    : Number.parseInt(delayMs.value, 10);
+  if (
+    !isDivider.value &&
+    (!Number.isFinite(parsedDelay) ||
+      parsedDelay < 0 ||
+      parsedDelay > MAX_STEP_DELAY_MS)
+  ) {
+    error.value = `Delay must be a whole number from 0 to ${MAX_STEP_DELAY_MS}.`;
     return;
   }
 
@@ -240,18 +363,29 @@ function onSubmit(): void {
     index.value === '' ? null : Number.parseInt(index.value, 10);
 
   const selectors =
-    stepType.value === 'navigate'
+    stepType.value === 'navigate' || stepType.value === 'divider'
       ? []
       : pickedSelectors.value.length > 0 &&
           pickedSelectors.value[0] === trimmedTarget
         ? [...pickedSelectors.value]
         : [trimmedTarget];
 
+  const trimmedName = stepName.value.trim().replace(/\s+/g, ' ');
+
   emit('save', {
     stepType: stepType.value,
+    name: trimmedName || null,
     selectors,
-    value: needsValue.value ? value.value : null,
+    value: needsScript.value
+      ? script
+      : needsTimeout.value
+        ? String(parsedTimeout)
+        : needsValue.value
+          ? value.value
+          : null,
     url: stepType.value === 'navigate' ? trimmedTarget : null,
+    delayMs: parsedDelay,
+    variableName: needsScript.value && trimmedVariable ? trimmedVariable : null,
     index: Number.isNaN(parsedIndex as number) ? null : parsedIndex,
     stepId: props.step?.id,
   });
@@ -268,6 +402,7 @@ function onSubmit(): void {
   >
     <div
       class="dialog"
+      :class="{ wide: needsScript }"
       role="dialog"
       aria-modal="true"
       :aria-label="title"
@@ -281,10 +416,29 @@ function onSubmit(): void {
 
       <form class="dialog-body" @submit.prevent="onSubmit">
         <label class="field">
+          <span>Name</span>
+          <input
+            ref="firstField"
+            v-model="stepName"
+            type="text"
+            :maxlength="MAX_STEP_NAME_CHARS"
+            placeholder="Optional"
+            :disabled="picking"
+          />
+          <p class="pick-hint muted">
+            {{
+              isDivider
+                ? 'Optional label on the divider. Playback skips this step.'
+                : 'When set, the step list shows this name instead of type and target.'
+            }}
+          </p>
+        </label>
+
+        <label class="field">
           <span>Type</span>
-          <select ref="firstField" v-model="stepType" :disabled="picking">
+          <select v-model="stepType" :disabled="picking">
             <option v-for="type in STEP_TYPES" :key="type" :value="type">
-              {{ type }}
+              {{ STEP_TYPE_LABELS[type] }}
             </option>
           </select>
         </label>
@@ -294,7 +448,7 @@ function onSubmit(): void {
           <div class="target-row">
             <input
               v-model="target"
-              :type="stepType === 'navigate' ? 'url' : 'text'"
+              type="text"
               :placeholder="targetPlaceholder"
               :disabled="picking"
               required
@@ -324,15 +478,78 @@ function onSubmit(): void {
           >
             {{ pickedSelectors.length }} fallback selectors saved
           </p>
+          <p v-else-if="stepType === 'navigate'" class="pick-hint muted">
+            Use &#123;&#123;baseUrl&#125;&#125; for the selected environment.
+          </p>
         </div>
+
+        <label v-if="needsScript" class="field">
+          <span>Script</span>
+          <textarea
+            v-model="value"
+            rows="8"
+            spellcheck="false"
+            placeholder="return document.querySelector('h1')?.textContent ?? '';"
+            required
+          ></textarea>
+          <p class="pick-hint muted">
+            Runs in the page. await is allowed. return a value to save it. &#123;&#123;name&#125;&#125; inserts a saved variable. Throw an error to fail the step.
+          </p>
+        </label>
+
+        <label v-if="needsScript" class="field">
+          <span>Save as variable</span>
+          <input
+            v-model="variableName"
+            type="text"
+            placeholder="email"
+            spellcheck="false"
+            autocomplete="off"
+          />
+          <p class="pick-hint muted">
+            Optional. An input step can insert it with &#123;&#123;email&#125;&#125;.
+          </p>
+        </label>
 
         <label v-if="needsValue" class="field">
           <span>Value</span>
           <input
             v-model="value"
             type="text"
-            placeholder="Text to type"
+            placeholder="Text or {{email}}"
             :disabled="picking"
+          />
+          <p class="pick-hint muted">
+            Use &#123;&#123;name&#125;&#125; for an environment or script variable.
+          </p>
+        </label>
+
+        <label v-if="needsTimeout" class="field">
+          <span>Timeout (ms)</span>
+          <input
+            v-model="timeoutMs"
+            type="number"
+            min="0"
+            :max="MAX_WAIT_MS"
+            step="500"
+            :disabled="picking"
+            required
+          />
+          <p class="pick-hint muted">
+            Playback waits until this element appears, then continues.
+          </p>
+        </label>
+
+        <label v-if="!isDivider" class="field">
+          <span>Delay after step (ms)</span>
+          <input
+            v-model="delayMs"
+            type="number"
+            min="0"
+            :max="MAX_STEP_DELAY_MS"
+            step="100"
+            :disabled="picking"
+            required
           />
         </label>
 
@@ -390,6 +607,10 @@ function onSubmit(): void {
   overflow: hidden;
 }
 
+.dialog.wide {
+  width: min(100%, 460px);
+}
+
 .dialog-head {
   display: flex;
   align-items: center;
@@ -429,13 +650,22 @@ function onSubmit(): void {
 }
 
 .field input,
-.field select {
+.field select,
+.field textarea {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.4rem 0.55rem;
   color: var(--text);
   background: #fff;
   font: inherit;
+}
+
+.field textarea {
+  resize: vertical;
+  min-height: 8rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.4;
 }
 
 .target-row {

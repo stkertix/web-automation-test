@@ -1,10 +1,16 @@
 import { MessageType, type ExtensionMessage } from '../shared/messages';
 import { buildSelectors, resolveElement } from '../shared/selector';
-import { createStep, type ExtensionMode, type TestStep } from '../shared/types';
+import {
+  createStep,
+  normalizeWaitMs,
+  type ExtensionMode,
+  type TestStep,
+} from '../shared/types';
 
 const INPUT_DEBOUNCE_MS = 400;
 
 let mode: ExtensionMode = 'idle';
+let modeEpoch = 0;
 let pickActive = false;
 let pickOverlay: HTMLDivElement | null = null;
 let inputTimer: ReturnType<typeof setTimeout> | null = null;
@@ -289,16 +295,62 @@ function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: strin
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForElement(step: TestStep): Promise<{
+  ok: boolean;
+  error?: string;
+  cancelled?: boolean;
+}> {
+  const timeoutMs = normalizeWaitMs(step.value);
+  const started = Date.now();
+
+  while (true) {
+    if (mode !== 'play') {
+      return { ok: false, cancelled: true };
+    }
+
+    if (resolveElement(step.selectors)) {
+      return { ok: true };
+    }
+
+    const elapsed = Date.now() - started;
+    if (elapsed >= timeoutMs) {
+      return {
+        ok: false,
+        error: `Timed out after ${timeoutMs} ms waiting for: ${step.selectors.join(', ')}`,
+      };
+    }
+
+    await sleep(Math.min(200, timeoutMs - elapsed));
+  }
+}
+
 async function runStep(step: TestStep): Promise<{
   ok: boolean;
   error?: string;
   navigated?: boolean;
+  cancelled?: boolean;
 }> {
   suppressRecording = true;
   try {
     if (step.type === 'navigate') {
       // Handled by background.
       return { ok: true, navigated: true };
+    }
+
+    if (step.type === 'wait') {
+      return await waitForElement(step);
+    }
+
+    if (step.type === 'script') {
+      return { ok: false, error: 'Script steps are run by the extension.' };
+    }
+
+    if (step.type === 'divider') {
+      return { ok: true };
     }
 
     const el = resolveElement(step.selectors);
@@ -380,10 +432,27 @@ async function runStep(step: TestStep): Promise<{
   }
 }
 
+async function syncModeFromBackground(): Promise<void> {
+  const epoch = modeEpoch;
+  try {
+    const response = (await browser.runtime.sendMessage({
+      type: MessageType.GET_CONTENT_MODE,
+    } satisfies ExtensionMessage)) as { mode?: ExtensionMode } | undefined;
+    if (epoch !== modeEpoch) return;
+    if (response?.mode === 'record' || response?.mode === 'play') {
+      mode = response.mode;
+      suppressRecording = response.mode === 'play';
+    }
+  } catch {
+    // Background may still be starting.
+  }
+}
+
 export default defineContentScript({
   matches: ['<all_urls>'],
   runAt: 'document_idle',
   main() {
+    void syncModeFromBackground();
     document.addEventListener('click', onClick, true);
     document.addEventListener('input', onInput, true);
     document.addEventListener('change', onChange, true);
@@ -392,6 +461,7 @@ export default defineContentScript({
     browser.runtime.onMessage.addListener((message: ExtensionMessage) => {
       switch (message.type) {
         case MessageType.SET_MODE:
+          modeEpoch += 1;
           if (mode === 'record' && message.mode !== 'record') {
             flushPendingInput();
           }

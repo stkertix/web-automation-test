@@ -12,14 +12,19 @@ import {
   createFolder,
   createLibraryTest,
   createStep,
+  applyVariables,
+  normalizeDelayMs,
+  normalizeEnvironments,
+  normalizeStepName,
+  normalizeVariableName,
+  normalizeWaitMs,
+  MAX_SCRIPT_CHARS,
   toTestCase,
   type ExtensionState,
   type TestCase,
   type TestLibrary,
   type TestStep,
 } from '../shared/types';
-
-const STEP_DELAY_MS = 200;
 
 let state: ExtensionState = {
   mode: 'idle',
@@ -34,6 +39,8 @@ let state: ExtensionState = {
 };
 
 let playbackCancelled = false;
+/** Values saved by script steps during the current playback session. */
+let playbackVariables = new Map<string, string>();
 
 function applyLibrary(library: TestLibrary): void {
   const active = getActiveTest(library);
@@ -82,9 +89,31 @@ function guardIdleEdit(): { ok: false; error: string } | null {
   return null;
 }
 
+const RECORDING_SESSION_KEY = 'recordingSession';
+
 async function getActiveTabId(): Promise<number | null> {
-  const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+  const tabs = await browser.tabs.query({
+    active: true,
+    lastFocusedWindow: true,
+  });
   return tabs[0]?.id ?? null;
+}
+
+async function saveRecordingSession(tabId: number | null): Promise<void> {
+  if (tabId == null) {
+    await browser.storage.session.remove(RECORDING_SESSION_KEY);
+    return;
+  }
+  await browser.storage.session.set({
+    [RECORDING_SESSION_KEY]: { tabId },
+  });
+}
+
+async function readRecordingSession(): Promise<{ tabId: number } | null> {
+  const stored = await browser.storage.session.get(RECORDING_SESSION_KEY);
+  const value = stored[RECORDING_SESSION_KEY] as { tabId?: unknown } | undefined;
+  if (!value || typeof value.tabId !== 'number') return null;
+  return { tabId: value.tabId };
 }
 
 async function sendToTab(
@@ -239,11 +268,13 @@ async function startRecording(): Promise<{ ok: true } | { ok: false; error: stri
     return { ok: false, error: 'Failed to start recording on this page.' };
   }
 
+  await saveRecordingSession(tabId);
   return { ok: true };
 }
 
 async function stopRecording(): Promise<{ ok: true }> {
   const tabId = state.activeTabId;
+  await saveRecordingSession(null);
   setState({ mode: 'idle', status: 'Idle' });
   if (tabId != null) {
     try {
@@ -277,19 +308,192 @@ function waitForTabComplete(tabId: number, timeoutMs = 15000): Promise<void> {
   });
 }
 
+type UserScriptInjectionResult = {
+  result?: { ok?: boolean; error?: string; value?: string | null };
+  error?: string;
+};
+
+function userScriptsApi(): {
+  getScripts: () => Promise<unknown>;
+  execute: (injection: {
+    target: { tabId: number };
+    js: { code: string }[];
+    world: 'MAIN';
+    injectImmediately: boolean;
+  }) => Promise<UserScriptInjectionResult[]>;
+} | null {
+  const api = (
+    browser as unknown as {
+      userScripts?: {
+        getScripts: () => Promise<unknown>;
+        execute?: (injection: {
+          target: { tabId: number };
+          js: { code: string }[];
+          world: 'MAIN';
+          injectImmediately: boolean;
+        }) => Promise<UserScriptInjectionResult[]>;
+      };
+    }
+  ).userScripts;
+  if (!api?.execute) return null;
+  return { getScripts: api.getScripts, execute: api.execute };
+}
+
+function userScriptsUnavailableMessage(): string {
+  return 'Script steps need Allow user scripts turned on. Open chrome://extensions, open this extension’s details, enable Allow user scripts, then reload the extension.';
+}
+
+async function runScriptOnTab(
+  tabId: number,
+  source: string,
+): Promise<{ ok: boolean; error?: string; value?: string | null }> {
+  const code = source.trim();
+  if (!code) {
+    return { ok: false, error: 'Script is empty.' };
+  }
+  if (code.length > MAX_SCRIPT_CHARS) {
+    return {
+      ok: false,
+      error: `Script is longer than ${MAX_SCRIPT_CHARS} characters.`,
+    };
+  }
+
+  const userScripts = userScriptsApi();
+  if (!userScripts) {
+    return { ok: false, error: userScriptsUnavailableMessage() };
+  }
+
+  try {
+    await userScripts.getScripts();
+  } catch {
+    return { ok: false, error: userScriptsUnavailableMessage() };
+  }
+
+  const wrapped = `(async () => {
+  const value = await (async () => {
+${code}
+  })();
+  if (value == null) return { ok: true, value: null };
+  const kind = typeof value;
+  if (kind === 'string' || kind === 'number' || kind === 'boolean') {
+    return { ok: true, value: String(value) };
+  }
+  try {
+    return { ok: true, value: JSON.stringify(value) };
+  } catch (error) {
+    return { ok: false, error: 'Script result could not be saved.' };
+  }
+})()`;
+
+  try {
+    const results = await userScripts.execute({
+      target: { tabId },
+      js: [{ code: wrapped }],
+      world: 'MAIN',
+      injectImmediately: true,
+    });
+    const first = results[0];
+    if (!first) {
+      return { ok: false, error: 'Script did not run.' };
+    }
+    if (first.error) {
+      return { ok: false, error: first.error };
+    }
+    if (first.result && first.result.ok === false) {
+      return { ok: false, error: first.result.error || 'Script failed.' };
+    }
+    return { ok: true, value: first.result?.value ?? null };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Script failed.';
+    if (/user script/i.test(message)) {
+      return { ok: false, error: userScriptsUnavailableMessage() };
+    }
+    return { ok: false, error: message };
+  }
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function playbackLookup(): Map<string, string> {
+  const merged = new Map<string, string>();
+  const active = state.library.environments.find(
+    (env) => env.id === state.library.activeEnvironmentId,
+  );
+  if (active) {
+    for (const variable of active.variables) {
+      merged.set(variable.name, variable.value);
+    }
+  }
+  for (const [name, value] of playbackVariables) {
+    merged.set(name, value);
+  }
+  return merged;
+}
+
+function resolveTemplate(
+  template: string,
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (!template.includes('{{')) return { ok: true, value: template };
+  return applyVariables(template, playbackLookup());
+}
+
+function resolveStepValue(
+  step: TestStep,
+): { ok: true; step: TestStep } | { ok: false; error: string } {
+  if (step.type !== 'input' && step.type !== 'change') {
+    return { ok: true, step };
+  }
+  if (!step.value || !step.value.includes('{{')) {
+    return { ok: true, step };
+  }
+  const applied = applyVariables(step.value, playbackLookup());
+  if (!applied.ok) return applied;
+  return { ok: true, step: { ...step, value: applied.value } };
 }
 
 async function runStepOnTab(tabId: number, step: TestStep): Promise<{
   ok: boolean;
   error?: string;
   navigated?: boolean;
+  cancelled?: boolean;
 }> {
+  const resolved = resolveStepValue(step);
+  if (!resolved.ok) return resolved;
+  step = resolved.step;
+
+  if (step.type === 'divider') {
+    return { ok: true };
+  }
+
+  if (step.type === 'script') {
+    let source = step.value ?? '';
+    if (source.includes('{{')) {
+      const applied = applyVariables(source, playbackLookup());
+      if (!applied.ok) return applied;
+      source = applied.value;
+    }
+    const result = await runScriptOnTab(tabId, source);
+    if (!result.ok) return result;
+    const variableName = normalizeVariableName(step.variableName);
+    if (variableName) {
+      if (result.value == null) {
+        return {
+          ok: false,
+          error: `Script did not return a value for {{${variableName}}}.`,
+        };
+      }
+      playbackVariables.set(variableName, result.value);
+    }
+    return { ok: true };
+  }
+
   if (step.type === 'navigate' && step.url) {
-    await browser.tabs.update(tabId, { url: step.url });
+    const url = resolveTemplate(step.url);
+    if (!url.ok) return url;
+    await browser.tabs.update(tabId, { url: url.value });
     await waitForTabComplete(tabId);
-    await delay(STEP_DELAY_MS);
     try {
       await setContentMode(tabId, 'play');
     } catch {
@@ -301,11 +505,10 @@ async function runStepOnTab(tabId: number, step: TestStep): Promise<{
   const result = (await sendToTab(tabId, {
     type: MessageType.RUN_STEP,
     step,
-  })) as { ok: boolean; error?: string; navigated?: boolean };
+  })) as { ok: boolean; error?: string; navigated?: boolean; cancelled?: boolean };
 
   if (result?.navigated) {
     await waitForTabComplete(tabId);
-    await delay(STEP_DELAY_MS);
     try {
       await setContentMode(tabId, 'play');
     } catch {
@@ -333,6 +536,7 @@ async function startPlayback(): Promise<{ ok: true } | { ok: false; error: strin
   }
 
   playbackCancelled = false;
+  playbackVariables = new Map();
   setState({
     mode: 'play',
     status: 'Playing',
@@ -355,6 +559,131 @@ async function startPlayback(): Promise<{ ok: true } | { ok: false; error: strin
 
   void runPlayback(tabId);
   return { ok: true };
+}
+
+async function playSingleStep(
+  stepId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (state.mode === 'record') {
+    return { ok: false, error: 'Stop recording before running a step.' };
+  }
+  if (state.mode === 'play') {
+    return { ok: false, error: 'Playback is already running.' };
+  }
+  if (state.mode === 'pick') {
+    return { ok: false, error: 'Finish or cancel element picking first.' };
+  }
+
+  const index = state.testCase.steps.findIndex((step) => step.id === stepId);
+  const step = state.testCase.steps[index];
+  if (!step || index < 0) {
+    return { ok: false, error: 'Step not found.' };
+  }
+
+  const tabId = await getActiveTabId();
+  if (tabId == null) {
+    return { ok: false, error: 'No active tab found.' };
+  }
+
+  playbackCancelled = false;
+  setState({
+    mode: 'play',
+    status: 'Playing',
+    activeTabId: tabId,
+    currentStepIndex: index,
+    lastError: null,
+    failedStepId: null,
+  });
+
+  try {
+    await setContentMode(tabId, 'play');
+  } catch {
+    setState({
+      mode: 'idle',
+      status: 'Failed',
+      lastError: 'Failed to start playback on this page.',
+      currentStepIndex: index,
+      failedStepId: step.id,
+    });
+    return { ok: false, error: 'Failed to start playback on this page.' };
+  }
+
+  void runSingleStep(tabId, step);
+  return { ok: true };
+}
+
+async function finishPlaybackIdle(tabId: number): Promise<void> {
+  setState({
+    mode: 'idle',
+    status: 'Idle',
+    currentStepIndex: null,
+    lastError: null,
+    failedStepId: null,
+  });
+  try {
+    await setContentMode(tabId, 'idle');
+  } catch {
+    // ignore
+  }
+}
+
+async function failPlayback(
+  tabId: number,
+  stepId: string,
+  index: number,
+  error: string,
+): Promise<void> {
+  setState({
+    mode: 'idle',
+    status: 'Failed',
+    lastError: error,
+    failedStepId: stepId,
+    currentStepIndex: index,
+  });
+  try {
+    await setContentMode(tabId, 'idle');
+  } catch {
+    // ignore
+  }
+}
+
+async function runSingleStep(tabId: number, step: TestStep): Promise<void> {
+  const index = state.currentStepIndex ?? 0;
+  try {
+    const result = await runStepOnTab(tabId, step);
+    if (playbackCancelled || result.cancelled) {
+      setState({
+        mode: 'idle',
+        status: 'Idle',
+        currentStepIndex: null,
+      });
+      try {
+        await setContentMode(tabId, 'idle');
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    if (!result.ok) {
+      await failPlayback(tabId, step.id, index, result.error ?? 'Step failed.');
+      return;
+    }
+  } catch (error) {
+    await failPlayback(
+      tabId,
+      step.id,
+      index,
+      error instanceof Error ? error.message : 'Step failed.',
+    );
+    return;
+  }
+
+  if (playbackCancelled) return;
+  if (step.type !== 'divider') {
+    await delay(normalizeDelayMs(step.delayMs));
+  }
+  if (playbackCancelled) return;
+  await finishPlaybackIdle(tabId);
 }
 
 async function runPlayback(tabId: number): Promise<void> {
@@ -382,6 +711,19 @@ async function runPlayback(tabId: number): Promise<void> {
 
     try {
       const result = await runStepOnTab(tabId, step);
+      if (playbackCancelled || result.cancelled) {
+        setState({
+          mode: 'idle',
+          status: 'Idle',
+          currentStepIndex: null,
+        });
+        try {
+          await setContentMode(tabId, 'idle');
+        } catch {
+          // ignore
+        }
+        return;
+      }
       if (!result.ok) {
         setState({
           mode: 'idle',
@@ -413,7 +755,10 @@ async function runPlayback(tabId: number): Promise<void> {
       return;
     }
 
-    await delay(STEP_DELAY_MS);
+    if (playbackCancelled) return;
+    if (step.type !== 'divider') {
+      await delay(normalizeDelayMs(step.delayMs));
+    }
   }
 
   setState({
@@ -495,10 +840,33 @@ function appendNavigateStep(url: string): void {
   );
 }
 
+function isRecordingTab(tabId: number): boolean {
+  return state.mode === 'record' && (state.activeTabId == null || state.activeTabId === tabId);
+}
+
+async function resumeRecordingOnTab(tabId: number): Promise<void> {
+  if (!isRecordingTab(tabId)) return;
+  try {
+    await setContentMode(tabId, 'record');
+  } catch {
+    // The next recorded event retries injection.
+  }
+}
+
 export default defineBackground(() => {
-  void (async () => {
+  const ready = (async () => {
     const library = await loadLibrary();
     applyLibrary(library);
+    const recording = await readRecordingSession();
+    if (recording) {
+      state = {
+        ...state,
+        mode: 'record',
+        status: 'Recording',
+        activeTabId: recording.tabId,
+      };
+      await resumeRecordingOnTab(recording.tabId);
+    }
     broadcastState();
   })();
 
@@ -507,22 +875,44 @@ export default defineBackground(() => {
   }
 
   browser.webNavigation.onCommitted.addListener((details) => {
-    if (details.frameId !== 0) return;
-    if (state.mode !== 'record') return;
-    if (state.activeTabId != null && details.tabId !== state.activeTabId) return;
-    if (
-      details.url.startsWith('chrome://') ||
-      details.url.startsWith('chrome-extension://')
-    ) {
-      return;
-    }
-    appendNavigateStep(details.url);
+    void ready.then(() => {
+      if (details.frameId !== 0) return;
+      if (!isRecordingTab(details.tabId)) return;
+      if (
+        details.url.startsWith('chrome://') ||
+        details.url.startsWith('chrome-extension://')
+      ) {
+        return;
+      }
+      appendNavigateStep(details.url);
+    });
   });
 
-  browser.runtime.onMessage.addListener((message: ExtensionMessage) => {
+  browser.webNavigation.onCompleted.addListener((details) => {
+    void ready.then(() => {
+      if (details.frameId !== 0) return;
+      void resumeRecordingOnTab(details.tabId);
+    });
+  });
+
+  browser.runtime.onMessage.addListener((message: ExtensionMessage, sender) => {
+    return (async () => {
+    await ready;
     switch (message.type) {
       case MessageType.GET_STATE:
         return Promise.resolve(state);
+
+      case MessageType.GET_CONTENT_MODE: {
+        const tabId = sender.tab?.id;
+        const tabMatches =
+          tabId != null &&
+          (state.activeTabId == null || state.activeTabId === tabId);
+        const mode =
+          tabMatches && (state.mode === 'record' || state.mode === 'play')
+            ? state.mode
+            : 'idle';
+        return { mode };
+      }
 
       case MessageType.START_RECORDING:
         return startRecording();
@@ -532,6 +922,9 @@ export default defineBackground(() => {
 
       case MessageType.START_PLAYBACK:
         return startPlayback();
+
+      case MessageType.PLAY_STEP:
+        return playSingleStep(message.stepId);
 
       case MessageType.STOP_PLAYBACK:
         return stopPlayback();
@@ -570,20 +963,63 @@ export default defineBackground(() => {
         }
 
         const step = createStep({
+          name: normalizeStepName(message.name),
           type: message.stepType,
           selectors:
-            message.stepType === 'navigate'
+            message.stepType === 'navigate' ||
+            message.stepType === 'script' ||
+            message.stepType === 'divider'
               ? []
               : (message.selectors ?? []).filter(Boolean),
           value:
             message.stepType === 'input' || message.stepType === 'change'
               ? (message.value ?? '')
-              : null,
+              : message.stepType === 'wait'
+                ? String(normalizeWaitMs(message.value))
+                : message.stepType === 'script'
+                  ? (message.value ?? '').trim()
+                  : null,
           url: message.stepType === 'navigate' ? (message.url ?? '') : null,
+          delayMs:
+            message.stepType === 'divider'
+              ? 0
+              : normalizeDelayMs(message.delayMs),
+          variableName:
+            message.stepType === 'script'
+              ? normalizeVariableName(message.variableName)
+              : null,
         });
 
         if (
+          message.stepType === 'script' &&
+          message.variableName?.trim() &&
+          !step.variableName
+        ) {
+          return Promise.resolve({
+            ok: false as const,
+            error:
+              'Variable name must start with a letter or underscore and use only letters, numbers, and underscores.',
+          });
+        }
+        if (message.stepType === 'script' && !step.value) {
+          return Promise.resolve({
+            ok: false as const,
+            error: 'Script is required.',
+          });
+        }
+        if (
+          message.stepType === 'script' &&
+          (step.value?.length ?? 0) > MAX_SCRIPT_CHARS
+        ) {
+          return Promise.resolve({
+            ok: false as const,
+            error: `Script must be at most ${MAX_SCRIPT_CHARS} characters.`,
+          });
+        }
+        if (
           message.stepType !== 'navigate' &&
+          message.stepType !== 'script' &&
+          message.stepType !== 'divider' &&
           step.selectors.length === 0
         ) {
           return Promise.resolve({
@@ -661,6 +1097,49 @@ export default defineBackground(() => {
         return persistAndBroadcast().then(() => ({ ok: true as const }));
       }
 
+      case MessageType.SET_ACTIVE_ENVIRONMENT: {
+        const blocked = guardIdleEdit();
+        if (blocked) return Promise.resolve(blocked);
+        const environmentId = message.environmentId;
+        if (
+          environmentId != null &&
+          !state.library.environments.some((env) => env.id === environmentId)
+        ) {
+          return Promise.resolve({
+            ok: false as const,
+            error: 'Environment not found.',
+          });
+        }
+        state = {
+          ...state,
+          library: {
+            ...state.library,
+            activeEnvironmentId: environmentId,
+          },
+        };
+        return persistAndBroadcast().then(() => ({ ok: true as const }));
+      }
+
+      case MessageType.SAVE_ENVIRONMENTS: {
+        const blocked = guardIdleEdit();
+        if (blocked) return Promise.resolve(blocked);
+        const environments = normalizeEnvironments(message.environments);
+        const activeEnvironmentId =
+          message.activeEnvironmentId != null &&
+          environments.some((env) => env.id === message.activeEnvironmentId)
+            ? message.activeEnvironmentId
+            : null;
+        state = {
+          ...state,
+          library: {
+            ...state.library,
+            environments,
+            activeEnvironmentId,
+          },
+        };
+        return persistAndBroadcast().then(() => ({ ok: true as const }));
+      }
+
       case MessageType.UPDATE_TEST_NAME:
         state = {
           ...state,
@@ -679,6 +1158,17 @@ export default defineBackground(() => {
             ...step,
             ...message.patch,
             selectors: message.patch.selectors ?? step.selectors,
+            delayMs: normalizeDelayMs(
+              message.patch.delayMs ?? step.delayMs,
+            ),
+            name:
+              message.patch.name === undefined
+                ? normalizeStepName(step.name)
+                : normalizeStepName(message.patch.name),
+            variableName:
+              message.patch.variableName === undefined
+                ? normalizeVariableName(step.variableName)
+                : normalizeVariableName(message.patch.variableName),
           };
         });
         state = {
@@ -1004,6 +1494,8 @@ export default defineBackground(() => {
           folders: message.library.folders,
           tests: message.library.tests,
           activeTestId: message.library.activeTestId,
+          environments: normalizeEnvironments(message.library.environments),
+          activeEnvironmentId: message.library.activeEnvironmentId ?? null,
         });
         state = {
           ...state,
@@ -1071,5 +1563,6 @@ export default defineBackground(() => {
       default:
         return undefined;
     }
+    })();
   });
 });

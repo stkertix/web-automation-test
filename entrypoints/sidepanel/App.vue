@@ -2,15 +2,18 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { MessageType, type ExtensionMessage } from '../../shared/messages';
 import {
+  downloadEnvironmentExportJson,
   downloadFolderExportJson,
   downloadLibraryExportJson,
   downloadTestCaseJson,
+  parseEnvironmentExportJson,
   parseFolderExportJson,
   parseLibraryExportJson,
   parseTestCaseJson,
   syncActiveTest,
 } from '../../shared/storage';
 import {
+  buildEnvironmentExport,
   buildFolderExport,
   buildLibraryExport,
   materializeFolderImport,
@@ -20,10 +23,12 @@ import {
   createEmptyTestCase,
   type ExtensionState,
   type StepType,
+  type TestEnvironment,
   type TestLibrary,
   type TestStep,
 } from '../../shared/types';
 import ConfirmDialog from './components/ConfirmDialog.vue';
+import EnvironmentBar from './components/EnvironmentBar.vue';
 import LibraryPanel from './components/LibraryPanel.vue';
 import StatusBar from './components/StatusBar.vue';
 import StepList from './components/StepList.vue';
@@ -45,6 +50,13 @@ const busy = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 const libraryFileInput = ref<HTMLInputElement | null>(null);
 const folderFileInput = ref<HTMLInputElement | null>(null);
+const environmentFileInput = ref<HTMLInputElement | null>(null);
+const pendingEnvironmentImport = ref<{
+  environments: TestEnvironment[];
+  activeEnvironmentId: string | null;
+} | null>(null);
+const importEnvironmentConfirmOpen = ref(false);
+const clearStepsConfirmOpen = ref(false);
 const folderImportParentId = ref<string | null>(null);
 const pendingLibraryImport = ref<TestLibrary | null>(null);
 const importLibraryConfirmOpen = ref(false);
@@ -59,6 +71,12 @@ const libraryLocked = computed(
   () =>
     busy.value || isRecording.value || isPlaying.value || isPicking.value,
 );
+const clearStepsMessage = computed(() => {
+  const count = state.value.testCase.steps.length;
+  const name = state.value.testCase.name.trim() || 'this test';
+  const steps = count === 1 ? 'step' : 'steps';
+  return `Clear all ${count} ${steps} from "${name}"?`;
+});
 
 async function send<T = { ok: boolean; error?: string }>(
   message: ExtensionMessage,
@@ -111,6 +129,32 @@ async function onStop(): Promise<void> {
   });
 }
 
+async function onSelectEnvironment(environmentId: string | null): Promise<void> {
+  await withBusy(async () => {
+    const res = await send({
+      type: MessageType.SET_ACTIVE_ENVIRONMENT,
+      environmentId,
+    });
+    applyError(res);
+    await refreshState();
+  });
+}
+
+async function onSaveEnvironments(
+  environments: TestEnvironment[],
+  activeEnvironmentId: string | null,
+): Promise<void> {
+  await withBusy(async () => {
+    const res = await send({
+      type: MessageType.SAVE_ENVIRONMENTS,
+      environments,
+      activeEnvironmentId,
+    });
+    applyError(res);
+    await refreshState();
+  });
+}
+
 async function onPlay(): Promise<void> {
   await withBusy(async () => {
     const res = await send({ type: MessageType.START_PLAYBACK });
@@ -119,7 +163,24 @@ async function onPlay(): Promise<void> {
   });
 }
 
-async function onClear(): Promise<void> {
+async function onPlayStep(stepId: string): Promise<void> {
+  await withBusy(async () => {
+    const res = await send({ type: MessageType.PLAY_STEP, stepId });
+    applyError(res);
+    await refreshState();
+  });
+}
+
+function requestClearSteps(): void {
+  clearStepsConfirmOpen.value = true;
+}
+
+function closeClearStepsConfirm(): void {
+  clearStepsConfirmOpen.value = false;
+}
+
+async function confirmClearSteps(): Promise<void> {
+  closeClearStepsConfirm();
   await withBusy(async () => {
     await send({ type: MessageType.CLEAR_STEPS });
     await refreshState();
@@ -133,7 +194,12 @@ async function onNameChange(name: string): Promise<void> {
 
 async function onUpdateStep(
   stepId: string,
-  patch: Partial<Pick<TestStep, 'type' | 'selectors' | 'value' | 'url'>>,
+  patch: Partial<
+    Pick<
+      TestStep,
+      'name' | 'type' | 'selectors' | 'value' | 'url' | 'delayMs' | 'variableName'
+    >
+  >,
 ): Promise<void> {
   await send({ type: MessageType.UPDATE_STEP, stepId, patch });
   await refreshState();
@@ -146,18 +212,24 @@ async function onDeleteStep(stepId: string): Promise<void> {
 
 async function onAddStep(payload: {
   stepType: StepType;
+  name?: string | null;
   selectors?: string[];
   value?: string | null;
   url?: string | null;
+  delayMs?: number;
+  variableName?: string | null;
   index?: number | null;
 }): Promise<void> {
   await withBusy(async () => {
     const res = await send({
       type: MessageType.ADD_STEP,
       stepType: payload.stepType,
+      name: payload.name,
       selectors: payload.selectors,
       value: payload.value,
       url: payload.url,
+      delayMs: payload.delayMs,
+      variableName: payload.variableName,
       index: payload.index,
     });
     applyError(res);
@@ -267,6 +339,52 @@ function onExportFolder(folderId: string): void {
 function onExportLibrary(): void {
   const library = syncActiveTest(state.value.library, state.value.testCase);
   downloadLibraryExportJson(buildLibraryExport(library));
+}
+
+function onExportEnvironments(): void {
+  const library = state.value.library;
+  downloadEnvironmentExportJson(
+    buildEnvironmentExport(library.environments, library.activeEnvironmentId),
+  );
+}
+
+function onImportEnvironmentsClick(): void {
+  environmentFileInput.value?.click();
+}
+
+async function onImportEnvironmentFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  try {
+    const text = await file.text();
+    pendingEnvironmentImport.value = parseEnvironmentExportJson(text);
+    importEnvironmentConfirmOpen.value = true;
+  } catch (error) {
+    state.value = {
+      ...state.value,
+      status: 'Failed',
+      lastError:
+        error instanceof Error
+          ? error.message
+          : 'Failed to import environment JSON.',
+    };
+  } finally {
+    input.value = '';
+  }
+}
+
+function closeImportEnvironmentConfirm(): void {
+  importEnvironmentConfirmOpen.value = false;
+  pendingEnvironmentImport.value = null;
+}
+
+async function confirmImportEnvironments(): Promise<void> {
+  const imported = pendingEnvironmentImport.value;
+  closeImportEnvironmentConfirm();
+  if (!imported) return;
+  await onSaveEnvironments(imported.environments, imported.activeEnvironmentId);
 }
 
 function onImportLibraryClick(): void {
@@ -458,6 +576,16 @@ onUnmounted(() => {
     />
 
     <section class="workspace">
+      <EnvironmentBar
+        :environments="state.library.environments"
+        :active-environment-id="state.library.activeEnvironmentId"
+        :disabled="libraryLocked"
+        @select="onSelectEnvironment"
+        @save="onSaveEnvironments"
+        @export="onExportEnvironments"
+        @import="onImportEnvironmentsClick"
+      />
+
       <Toolbar
         :disabled="busy || isPicking"
         :is-recording="isRecording"
@@ -467,7 +595,7 @@ onUnmounted(() => {
         @record="onRecord"
         @stop="onStop"
         @play="onPlay"
-        @clear="onClear"
+        @clear="requestClearSteps"
         @export="onExport"
         @import="onImportClick"
       />
@@ -490,13 +618,14 @@ onUnmounted(() => {
         @add-step="onAddStep"
         @reorder-steps="onReorderSteps"
         @rename-test="onNameChange"
+        @play-step="onPlayStep"
       />
     </section>
 
     <input
       ref="fileInput"
       type="file"
-      accept="application/json,.json"
+      accept="application/json,.json,.test.json"
       hidden
       @change="onImportFile"
     />
@@ -515,6 +644,33 @@ onUnmounted(() => {
       accept="application/json,.json,.folder.json"
       hidden
       @change="onImportFolderFile"
+    />
+
+    <input
+      ref="environmentFileInput"
+      type="file"
+      accept="application/json,.json"
+      hidden
+      @change="onImportEnvironmentFile"
+    />
+
+    <ConfirmDialog
+      :open="clearStepsConfirmOpen"
+      title="Clear steps"
+      :message="clearStepsMessage"
+      confirm-label="Clear"
+      @close="closeClearStepsConfirm"
+      @confirm="confirmClearSteps"
+    />
+
+    <ConfirmDialog
+      :open="importEnvironmentConfirmOpen"
+      title="Import environments"
+      message="Replace the current environments with the imported file?"
+      confirm-label="Replace"
+      :danger="false"
+      @close="closeImportEnvironmentConfirm"
+      @confirm="confirmImportEnvironments"
     />
 
     <ConfirmDialog

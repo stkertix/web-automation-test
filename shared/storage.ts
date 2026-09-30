@@ -2,14 +2,20 @@ import {
   createEmptyLibrary,
   createEmptyTestCase,
   createLibraryTest,
+  normalizeDelayMs,
+  normalizeEnvironments,
+  normalizeStepName,
+  normalizeVariableName,
   type LibraryTest,
   type TestCase,
+  type TestEnvironment,
   type TestFolder,
   type TestLibrary,
   type TestStep,
 } from './types';
 import {
   normalizeFolders,
+  type EnvironmentExportPayload,
   type FolderExportNode,
   type FolderExportPayload,
   type LibraryExportPayload,
@@ -48,7 +54,9 @@ function isValidStep(value: unknown): value is TestStep {
     Array.isArray(step.selectors) &&
     step.selectors.every((selector) => typeof selector === 'string') &&
     (step.value === null || typeof step.value === 'string') &&
-    (step.url === null || typeof step.url === 'string')
+    (step.url === null || typeof step.url === 'string') &&
+    (step.name == null || typeof step.name === 'string') &&
+    (step.variableName == null || typeof step.variableName === 'string')
   );
 }
 
@@ -113,6 +121,21 @@ function isValidFolderExportNode(value: unknown): value is FolderExportNode {
   );
 }
 
+function isValidEnvironmentExport(
+  value: unknown,
+): value is EnvironmentExportPayload {
+  if (!value || typeof value !== 'object') return false;
+  const payload = value as EnvironmentExportPayload;
+  return (
+    payload.version === 1 &&
+    payload.type === 'environment-export' &&
+    typeof payload.exportedAt === 'string' &&
+    Array.isArray(payload.environments) &&
+    (payload.activeEnvironmentId === null ||
+      typeof payload.activeEnvironmentId === 'string')
+  );
+}
+
 function isValidFolderExport(value: unknown): value is FolderExportPayload {
   if (!value || typeof value !== 'object') return false;
   const payload = value as FolderExportPayload;
@@ -124,11 +147,33 @@ function isValidFolderExport(value: unknown): value is FolderExportPayload {
   );
 }
 
+function normalizeSteps(steps: TestStep[]): TestStep[] {
+  return steps.map((step) => ({
+    ...step,
+    name: normalizeStepName(step.name),
+    delayMs: normalizeDelayMs(step.delayMs),
+    variableName: normalizeVariableName(step.variableName),
+  }));
+}
+
 function normalizeLibrary(library: TestLibrary): TestLibrary {
   let next: TestLibrary = {
     ...library,
     folders: normalizeFolders(library.folders),
+    tests: library.tests.map((test) => ({
+      ...test,
+      steps: normalizeSteps(test.steps),
+    })),
+    environments: normalizeEnvironments(library.environments),
+    activeEnvironmentId: library.activeEnvironmentId ?? null,
   };
+
+  if (
+    next.activeEnvironmentId &&
+    !next.environments.some((env) => env.id === next.activeEnvironmentId)
+  ) {
+    next = { ...next, activeEnvironmentId: null };
+  }
 
   if (next.tests.length === 0) {
     const test = createLibraryTest(createEmptyTestCase());
@@ -171,6 +216,8 @@ export async function loadLibrary(): Promise<TestLibrary> {
       folders: [],
       tests: [test],
       activeTestId: test.id,
+      environments: [],
+      activeEnvironmentId: null,
     };
     await saveLibrary(library);
     await browser.storage.local.remove(LEGACY_DRAFT_KEY);
@@ -214,7 +261,7 @@ export function syncActiveTest(
 export function downloadTestCaseJson(testCase: TestCase): void {
   downloadJsonFile(
     testCase,
-    `${safeFileName(testCase.name) || 'test'}.json`,
+    `step.${safeFileName(testCase.name) || 'test'}-${exportStamp()}.json`,
   );
 }
 
@@ -223,15 +270,32 @@ export function downloadFolderExportJson(
 ): void {
   downloadJsonFile(
     payload,
-    `${safeFileName(payload.folder.name) || 'folder'}.folder.json`,
+    `folder.${safeFileName(payload.folder.name) || 'folder'}-${exportStamp()}.json`,
   );
 }
 
 export function downloadLibraryExportJson(
   payload: LibraryExportPayload,
 ): void {
-  const stamp = payload.exportedAt.slice(0, 10);
-  downloadJsonFile(payload, `library-${stamp}.library.json`);
+  downloadJsonFile(payload, `library-${exportStamp()}.json`);
+}
+
+export function downloadEnvironmentExportJson(
+  payload: EnvironmentExportPayload,
+): void {
+  downloadJsonFile(payload, `environment-${exportStamp()}.json`);
+}
+
+/** Local time as YYYYMMDD-HHmmss, for example 20260930-135642. */
+function exportStamp(date = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const year = date.getFullYear();
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  const seconds = pad(date.getSeconds());
+  return `${year}${month}${day}-${hours}${minutes}${seconds}`;
 }
 
 function safeFileName(name: string): string {
@@ -255,7 +319,10 @@ export function parseTestCaseJson(raw: string): TestCase {
   if (!isValidTestCase(parsed)) {
     throw new Error('Invalid test case JSON');
   }
-  return parsed;
+  return {
+    ...parsed,
+    steps: normalizeSteps(parsed.steps),
+  };
 }
 
 export function parseLibraryExportJson(raw: string): TestLibrary {
@@ -273,7 +340,31 @@ export function parseLibraryExportJson(raw: string): TestLibrary {
     folders: parsed.library.folders,
     tests: parsed.library.tests,
     activeTestId: parsed.library.activeTestId,
+    environments: parsed.library.environments ?? [],
+    activeEnvironmentId: parsed.library.activeEnvironmentId ?? null,
   });
+}
+
+export function parseEnvironmentExportJson(raw: string): {
+  environments: TestEnvironment[];
+  activeEnvironmentId: string | null;
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('Invalid environment export JSON');
+  }
+  if (!isValidEnvironmentExport(parsed)) {
+    throw new Error('Invalid environment export JSON');
+  }
+  const environments = normalizeEnvironments(parsed.environments);
+  const activeEnvironmentId =
+    parsed.activeEnvironmentId != null &&
+    environments.some((env) => env.id === parsed.activeEnvironmentId)
+      ? parsed.activeEnvironmentId
+      : null;
+  return { environments, activeEnvironmentId };
 }
 
 export function parseFolderExportJson(raw: string): FolderExportPayload {

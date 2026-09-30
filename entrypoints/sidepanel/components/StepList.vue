@@ -1,6 +1,12 @@
 <script lang="ts" setup>
-import { computed, ref } from 'vue';
-import type { StepType, TestStep } from '../../../shared/types';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import {
+  normalizeDelayMs,
+  normalizeStepName,
+  normalizeWaitMs,
+  type StepType,
+  type TestStep,
+} from '../../../shared/types';
 import ConfirmDialog from './ConfirmDialog.vue';
 import Icon from './Icon.vue';
 import StepDialog, {
@@ -8,7 +14,7 @@ import StepDialog, {
   type StepDialogResult,
 } from './StepDialog.vue';
 
-defineProps<{
+const props = defineProps<{
   steps: TestStep[];
   currentStepIndex: number | null;
   failedStepId: string | null;
@@ -19,20 +25,29 @@ defineProps<{
 const emit = defineEmits<{
   updateStep: [
     stepId: string,
-    patch: Partial<Pick<TestStep, 'type' | 'selectors' | 'value' | 'url'>>,
+    patch: Partial<
+      Pick<
+        TestStep,
+        'name' | 'type' | 'selectors' | 'value' | 'url' | 'delayMs' | 'variableName'
+      >
+    >,
   ];
   deleteStep: [stepId: string];
   reorderSteps: [fromIndex: number, toIndex: number];
   addStep: [
     payload: {
       stepType: StepType;
+      name?: string | null;
       selectors?: string[];
       value?: string | null;
       url?: string | null;
+      delayMs?: number;
+      variableName?: string | null;
       index?: number | null;
     },
   ];
   renameTest: [name: string];
+  playStep: [stepId: string];
 }>();
 
 const dialogOpen = ref(false);
@@ -45,23 +60,139 @@ const dragOverIndex = ref<number | null>(null);
 const confirmOpen = ref(false);
 const pendingDeleteStep = ref<TestStep | null>(null);
 const pendingDeleteIndex = ref<number | null>(null);
+const menu = ref<{
+  stepId: string;
+  top: number;
+  left: number;
+} | null>(null);
+
+const everyStepNamed = computed(() => {
+  const details = props.steps.filter((step) => step.type !== 'divider');
+  return details.length > 0 && details.every((step) => stepName(step) != null);
+});
+
+const tableColumnCount = computed(() => {
+  let count = 2;
+  count += everyStepNamed.value ? 1 : 3;
+  if (props.editable) count += 2;
+  return count;
+});
 
 const confirmMessage = computed(() => {
   const step = pendingDeleteStep.value;
   const index = pendingDeleteIndex.value;
   if (!step || index == null) return 'Delete this step?';
-  const label =
-    step.type === 'navigate'
-      ? step.url || 'navigate'
-      : step.selectors[0] || step.type;
-  return `Delete step ${index + 1} (${step.type}: ${label})?`;
+  if (step.type === 'divider') {
+    const named = stepName(step);
+    return named
+      ? `Delete divider ${index + 1} (${named})?`
+      : `Delete divider ${index + 1}?`;
+  }
+  const named = stepName(step);
+  if (named) return `Delete step ${index + 1} (${named})?`;
+  const label = targetValue(step) || step.type;
+  return `Delete step ${index + 1} (${typeLabel(step)}: ${label})?`;
 });
 
-function targetValue(step: TestStep): string {
-  return step.type === 'navigate' ? (step.url ?? '') : (step.selectors[0] ?? '');
+function stepName(step: TestStep): string | null {
+  return normalizeStepName(step.name);
 }
 
+function targetValue(step: TestStep): string {
+  if (step.type === 'navigate') return step.url ?? '';
+  if (step.type === 'script') {
+    return (step.value ?? '').replace(/\s+/g, ' ').trim();
+  }
+  return step.selectors[0] ?? '';
+}
+
+function delayLabel(step: TestStep): string {
+  return `${normalizeDelayMs(step.delayMs)} ms`;
+}
+
+function valueLabel(step: TestStep): string {
+  if (step.type === 'input' || step.type === 'change') {
+    return step.value ?? '—';
+  }
+  if (step.type === 'wait') {
+    return `${normalizeWaitMs(step.value)} ms`;
+  }
+  if (step.type === 'script' && step.variableName) {
+    return `{{${step.variableName}}}`;
+  }
+  return '—';
+}
+
+function typeLabel(step: TestStep): string {
+  return step.type === 'wait' ? 'wait element' : step.type;
+}
+
+function closeMenu(): void {
+  menu.value = null;
+}
+
+function menuStep(): { step: TestStep; index: number } | null {
+  const open = menu.value;
+  if (!open) return null;
+  const index = props.steps.findIndex((step) => step.id === open.stepId);
+  const step = props.steps[index];
+  if (!step || index < 0) return null;
+  return { step, index };
+}
+
+function toggleMenu(stepId: string, event: MouseEvent): void {
+  if (menu.value?.stepId === stepId) {
+    closeMenu();
+    return;
+  }
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  const width = 196;
+  const height = 188;
+  let top = rect.bottom + 4;
+  if (top + height > window.innerHeight - 8) {
+    top = Math.max(8, rect.top - height - 4);
+  }
+  let left = rect.right - width;
+  if (left < 8) left = 8;
+  if (left + width > window.innerWidth - 8) {
+    left = Math.max(8, window.innerWidth - width - 8);
+  }
+  menu.value = { stepId, top, left };
+}
+
+function onDocumentPointerDown(event: PointerEvent): void {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    closeMenu();
+    return;
+  }
+  if (
+    target.closest('[data-step-menu]') ||
+    target.closest('[data-step-menu-trigger]')
+  ) {
+    return;
+  }
+  closeMenu();
+}
+
+function onDocumentKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape') closeMenu();
+}
+
+onMounted(() => {
+  document.addEventListener('pointerdown', onDocumentPointerDown);
+  document.addEventListener('keydown', onDocumentKeydown);
+  document.addEventListener('scroll', closeMenu, true);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', onDocumentPointerDown);
+  document.removeEventListener('keydown', onDocumentKeydown);
+  document.removeEventListener('scroll', closeMenu, true);
+});
+
 function openAdd(index: number | null = null): void {
+  closeMenu();
   dialogMode.value = 'add';
   editingStep.value = null;
   insertIndex.value = index;
@@ -69,10 +200,46 @@ function openAdd(index: number | null = null): void {
 }
 
 function openEdit(step: TestStep): void {
+  closeMenu();
   dialogMode.value = 'edit';
   editingStep.value = step;
   insertIndex.value = null;
   dialogOpen.value = true;
+}
+
+function duplicateStep(): void {
+  const current = menuStep();
+  closeMenu();
+  if (!current) return;
+  emit('addStep', {
+    stepType: current.step.type,
+    name: current.step.name ?? null,
+    selectors: [...current.step.selectors],
+    value: current.step.value,
+    url: current.step.url,
+    delayMs: current.step.delayMs,
+    variableName: current.step.variableName ?? null,
+    index: current.index + 1,
+  });
+}
+
+function editFromMenu(): void {
+  const current = menuStep();
+  if (!current) return;
+  openEdit(current.step);
+}
+
+function addAfterFromMenu(): void {
+  const current = menuStep();
+  if (!current) return;
+  const nextIndex = current.index + 1;
+  openAdd(nextIndex >= props.steps.length ? null : nextIndex);
+}
+
+function deleteFromMenu(): void {
+  const current = menuStep();
+  if (!current) return;
+  requestDeleteStep(current.step, current.index);
 }
 
 function closeDialog(): void {
@@ -81,6 +248,7 @@ function closeDialog(): void {
 }
 
 function requestDeleteStep(step: TestStep, index: number): void {
+  closeMenu();
   pendingDeleteStep.value = step;
   pendingDeleteIndex.value = index;
   confirmOpen.value = true;
@@ -103,20 +271,29 @@ function confirmDeleteStep(): void {
 function onDialogSave(result: StepDialogResult): void {
   if (dialogMode.value === 'edit' && result.stepId) {
     const patch: Partial<
-      Pick<TestStep, 'type' | 'selectors' | 'value' | 'url'>
+      Pick<
+        TestStep,
+        'name' | 'type' | 'selectors' | 'value' | 'url' | 'delayMs' | 'variableName'
+      >
     > = {
+      name: result.name,
       type: result.stepType,
       selectors: result.selectors,
       value: result.value,
       url: result.url,
+      delayMs: result.delayMs,
+      variableName: result.variableName,
     };
     emit('updateStep', result.stepId, patch);
   } else {
     emit('addStep', {
       stepType: result.stepType,
+      name: result.name,
       selectors: result.selectors,
       value: result.value,
       url: result.url,
+      delayMs: result.delayMs,
+      variableName: result.variableName,
       index: result.index,
     });
   }
@@ -197,9 +374,13 @@ function onDragEnd(): void {
           <tr>
             <th v-if="editable" class="col-drag"></th>
             <th class="col-num">#</th>
-            <th class="col-type">Type</th>
-            <th class="col-target">Target</th>
-            <th class="col-value">Value</th>
+            <th v-if="everyStepNamed" class="col-name">Name</th>
+            <template v-else>
+              <th class="col-type">Type</th>
+              <th class="col-target">Target</th>
+              <th class="col-value">Value</th>
+            </template>
+            <th class="col-delay">Delay</th>
             <th v-if="editable" class="col-actions">Actions</th>
           </tr>
         </thead>
@@ -210,12 +391,50 @@ function onDragEnd(): void {
             :class="{
               active: currentStepIndex === index,
               failed: failedStepId === step.id,
+              divider: step.type === 'divider',
               dragging: dragFromIndex === index,
               'drag-over': dragOverIndex === index && dragFromIndex !== index,
             }"
             @dragover="editable && onDragOver($event, index)"
             @drop="editable && onDrop($event, index)"
           >
+            <td
+              v-if="step.type === 'divider'"
+              class="divider-cell"
+              :colspan="tableColumnCount"
+            >
+              <div class="divider-inner">
+                <button
+                  v-if="editable"
+                  class="drag-handle btn-icon"
+                  type="button"
+                  draggable="true"
+                  title="Drag to reorder"
+                  aria-label="Drag to reorder"
+                  @dragstart="onDragStart($event, index)"
+                  @dragend="onDragEnd"
+                >
+                  <Icon name="fi-rr-grip-dots-vertical" />
+                </button>
+                <div class="divider-line">
+                  <span v-if="stepName(step)">{{ stepName(step) }}</span>
+                </div>
+                <button
+                  v-if="editable"
+                  class="btn-icon"
+                  type="button"
+                  data-step-menu-trigger
+                  title="Step actions"
+                  aria-label="Step actions"
+                  aria-haspopup="menu"
+                  :aria-expanded="menu?.stepId === step.id"
+                  @click.stop="toggleMenu(step.id, $event)"
+                >
+                  <Icon name="fi-rr-menu-dots" />
+                </button>
+              </div>
+            </td>
+            <template v-else>
             <td v-if="editable" class="col-drag">
               <button
                 class="drag-handle btn-icon"
@@ -230,48 +449,92 @@ function onDragEnd(): void {
               </button>
             </td>
             <td class="col-num">{{ index + 1 }}</td>
-            <td class="col-type">
-              <span class="type-label">{{ step.type }}</span>
-            </td>
-            <td class="col-target">
-              <span class="cell-text" :title="targetValue(step)">
-                {{ targetValue(step) || '—' }}
+            <td
+              v-if="stepName(step)"
+              class="col-name"
+              :colspan="everyStepNamed ? 1 : 3"
+            >
+              <span class="cell-text name-text" :title="stepName(step) ?? ''">
+                {{ stepName(step) }}
               </span>
             </td>
-            <td class="col-value">
-              <span class="cell-text" :title="step.value ?? ''">
-                {{
-                  step.type === 'input' || step.type === 'change'
-                    ? (step.value ?? '—')
-                    : '—'
-                }}
-              </span>
-            </td>
+            <template v-else>
+              <td class="col-type">
+                <span class="type-label">{{ typeLabel(step) }}</span>
+              </td>
+              <td class="col-target">
+                <span class="cell-text" :title="targetValue(step)">
+                  {{ targetValue(step) || '—' }}
+                </span>
+              </td>
+              <td class="col-value">
+                <span class="cell-text" :title="valueLabel(step)">
+                  {{ valueLabel(step) }}
+                </span>
+              </td>
+            </template>
+            <td class="col-delay">{{ delayLabel(step) }}</td>
             <td v-if="editable" class="col-actions">
-              <button class="btn-icon" type="button" title="Edit step" @click="openEdit(step)">
-                <Icon name="fi-rr-pencil" />
+              <button
+                class="btn-icon"
+                type="button"
+                title="Run this step"
+                @click="emit('playStep', step.id)"
+              >
+                <Icon name="fi-rr-play" />
               </button>
               <button
                 class="btn-icon"
                 type="button"
-                title="Add step after this one"
-                @click="openAdd(index + 1 >= steps.length ? null : index + 1)"
+                data-step-menu-trigger
+                title="Step actions"
+                aria-label="Step actions"
+                aria-haspopup="menu"
+                :aria-expanded="menu?.stepId === step.id"
+                @click.stop="toggleMenu(step.id, $event)"
               >
-                <Icon name="fi-rr-plus" />
-              </button>
-              <button
-                class="btn-icon danger"
-                type="button"
-                title="Delete step"
-                @click="requestDeleteStep(step, index)"
-              >
-                <Icon name="fi-rr-trash" />
+                <Icon name="fi-rr-menu-dots" />
               </button>
             </td>
+            </template>
           </tr>
         </tbody>
       </table>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="menu"
+        class="step-menu"
+        data-step-menu
+        role="menu"
+        :style="{ top: `${menu.top}px`, left: `${menu.left}px` }"
+        @click.stop
+      >
+        <button type="button" role="menuitem" @click="editFromMenu">
+          <Icon name="fi-rr-pencil" />
+          Edit
+        </button>
+        <button type="button" role="menuitem" @click="duplicateStep">
+          <Icon name="fi-rr-copy" />
+          Duplicate
+        </button>
+        <button type="button" role="menuitem" @click="addAfterFromMenu">
+          <Icon name="fi-rr-plus" />
+          Add step after
+        </button>
+        <div class="menu-sep" role="separator"></div>
+        <button
+          class="danger"
+          type="button"
+          role="menuitem"
+          @click="deleteFromMenu"
+        >
+          <Icon name="fi-rr-trash" />
+          Delete
+        </button>
+      </div>
+    </Teleport>
 
     <StepDialog
       :open="dialogOpen"
@@ -407,6 +670,43 @@ tbody tr.drag-over td {
   box-shadow: inset 0 2px 0 0 var(--accent);
 }
 
+tbody tr.divider td {
+  background: #f8fafc;
+}
+
+.divider-inner {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.divider-line {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.divider-line::before,
+.divider-line::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+.divider-line span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 70%;
+}
+
 .col-drag {
   width: 2rem;
 }
@@ -419,17 +719,74 @@ tbody tr.drag-over td {
 }
 
 .col-type {
-  width: 5.5rem;
+  width: 7rem;
+}
+
+.col-name {
+  min-width: 8rem;
+}
+
+.name-text {
+  max-width: none;
+  font-weight: 650;
 }
 
 .col-actions {
-  width: 6.5rem;
+  width: 4.6rem;
   white-space: nowrap;
+}
+
+.step-menu {
+  position: fixed;
+  z-index: 40;
+  width: 12.25rem;
+  padding: 0.3rem;
+  background: var(--panel, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(28, 35, 48, 0.16);
+  display: flex;
+  flex-direction: column;
+}
+
+.step-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.45rem;
+  width: 100%;
+  min-height: 2rem;
+  border: 0;
+  background: transparent;
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  color: var(--text, #1c2330);
+  text-align: left;
+}
+
+.step-menu button:hover {
+  background: #f3f5f8;
+}
+
+.step-menu button.danger {
+  color: var(--danger, #d92d20);
+}
+
+.menu-sep {
+  height: 1px;
+  margin: 0.25rem 0.2rem;
+  background: var(--border, #e5e7eb);
 }
 
 .col-target,
 .col-value {
   min-width: 4.5rem;
+}
+
+.col-delay {
+  width: 4.5rem;
+  white-space: nowrap;
+  color: var(--muted);
 }
 
 .type-label {

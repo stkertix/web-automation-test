@@ -14,6 +14,7 @@ export default defineConfig({
       'tabs',
       'activeTab',
       'webNavigation',
+      'userScripts',
     ],
     host_permissions: ['<all_urls>'],
     action: {
